@@ -863,6 +863,41 @@ static struct mm_region t8140_mem_map[CONFIG_NR_DRAM_BANKS + 3] = {
 	}
 };
 
+/* J604 / T8132 map from the independently captured Mac16,1 ADT. */
+static struct mm_region t8132_mem_map[] = {
+	{
+		/* Apple I/O blocks span 0x200000000 through 0x501840000. */
+		.virt = 0x200000000,
+		.phys = 0x200000000,
+		.size = 16UL * SZ_1G,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRNE) |
+			 PTE_BLOCK_NON_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		/* T8132 PCIe host aperture from the captured ADT. */
+		.virt = 0x1cb0000000,
+		.phys = 0x1cb0000000,
+		.size = SZ_256M,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_DEVICE_NGNRE) |
+			 PTE_BLOCK_INNER_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		/* Populated from the live FDT memory bank before MMU setup. */
+		.virt = 0x10000000000,
+		.phys = 0x10000000000,
+		.size = SZ_1G,
+		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL) |
+			 PTE_BLOCK_INNER_SHARE
+	}, {
+		/* Firmware framebuffer, if present in the inherited FDT. */
+		.attrs = PTE_BLOCK_MEMTYPE(MT_NORMAL_NC) |
+			 PTE_BLOCK_INNER_SHARE |
+			 PTE_BLOCK_PXN | PTE_BLOCK_UXN
+	}, {
+		0,
+	}
+};
+
 /* Apple M5 (J813), primary I/O range measured from the live Apple ADT.
  * RAM and framebuffer entries are populated from the m1n1-patched FDT.
  */
@@ -973,6 +1008,8 @@ void build_mem_map(void)
 		mem_map = t6022_mem_map;
 	else if (of_machine_is_compatible("apple,t8122"))
 		mem_map = t8122_mem_map;
+	else if (of_machine_is_compatible("apple,t8132"))
+		mem_map = t8132_mem_map;
 	else if (of_machine_is_compatible("apple,t6030") ||
 		 of_machine_is_compatible("apple,t6031") ||
 		 of_machine_is_compatible("apple,t6034"))
@@ -1130,7 +1167,7 @@ char *env_fat_get_dev_part(void)
 #define lmb_alloc(size, addr) lmb_alloc_mem(LMB_MEM_ALLOC_ANY, SZ_2M, addr, size, LMB_NONE)
 
 /*
- * Aurora Silicon boot flow for the MacBook Neo (A18 Pro, T8140).
+ * Aurora Silicon boot flow for T8140 and J604 / T8132.
  *
  * m1n1 hands U-Boot the Linux devicetree it prepared, with the kernel
  * command line in /chosen/bootargs.  First load the removable-media EFI
@@ -1149,6 +1186,13 @@ static const char * const t8140_env[][2] = {
 	  "echo AURORA_UBOOT_BOOT: fallback; run aurora_fallback; "
 	  "echo AURORA_UBOOT_BOOT: bootflow; bootflow scan -b; "
 	  "echo AURORA_UBOOT_BOOT_FAIL: no bootable entry; run aurora_rescue" },
+	{ "aurora_j604_boot",
+	  "if test -n \"${aurora_fallback_image}\"; then run aurora_fallback; fi; "
+	  "echo J604: EFI on internal ESP; run aurora_efi; "
+	  "echo J604: fw_dev_part=${fw_dev_part}; coninfo; "
+	  "nvme info; part list nvme 0; "
+	  "echo J604: bootflow; bootflow scan -lb; "
+	  "echo J604: efi; run aurora_efi; echo J604: end" },
 	{ "aurora_efi",
 	  "if test -n \"${fw_dev_part}\"; then "
 	  "load nvme ${fw_dev_part} ${kernel_addr_r} EFI/BOOT/BOOTAA64.EFI && "
@@ -1208,7 +1252,8 @@ static void t8140_late_init(void)
 	 * works by hand.
 	 */
 	if (!strcmp(env_get("bootcmd") ?: "", CONFIG_BOOTCOMMAND))
-		env_set("bootcmd", "run aurora_boot");
+		env_set("bootcmd", of_machine_is_compatible("apple,j604") ?
+			"run aurora_j604_boot" : "run aurora_boot");
 	if (!strcmp(env_get("boot_targets") ?: "", "nvme usb"))
 		env_set("boot_targets", "nvme");
 	if (!strcmp(env_get("preboot") ?: "", "usb start"))
@@ -1243,7 +1288,9 @@ int board_late_init(void)
 	env_set("storage_interface", blk_get_uclass_name(UCLASS_NVME));
 	env_set("fw_dev_part", asahi_esp_devpart());
 
-	if (of_machine_is_compatible("apple,t8140"))
+	if (of_machine_is_compatible("apple,t8140") ||
+	    (of_machine_is_compatible("apple,j604") &&
+	     of_machine_is_compatible("apple,t8132")))
 		t8140_late_init();
 
 	/* somewhat based on the Linux Kernel boot requirements:
@@ -1278,8 +1325,16 @@ int ft_board_setup(void *blob, struct bd_info *bd)
 	int node, ret;
 
 	/* Coprocessors handed over running must be described in every case. */
-	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB))
-		apple_rtkit_helper_fdt_fixup(blob);
+	if (IS_ENABLED(CONFIG_APPLE_MTP_KEYB)) {
+		ret = apple_rtkit_helper_fdt_fixup(blob);
+		if (ret)
+			return ret;
+	}
+	if (IS_ENABLED(CONFIG_NVME_APPLE)) {
+		ret = apple_nvme_fdt_fixup(blob);
+		if (ret)
+			return ret;
+	}
 
 	/*
 	 * Modify the "stdout-path" property under "/chosen" to point

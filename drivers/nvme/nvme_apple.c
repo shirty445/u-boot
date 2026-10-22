@@ -13,6 +13,8 @@
 #include <asm/io.h>
 #include <asm/arch/rtkit.h>
 #include <asm/arch/sart.h>
+#include <fdtdec.h>
+#include <linux/delay.h>
 #include <linux/iopoll.h>
 #include <linux/sizes.h>
 
@@ -66,16 +68,13 @@ struct ans_nvmmu_tcb {
 #define ANS_NVMMU_TCB_READ	BIT(1)
 
 /*
- * On post-M4 controllers (A18 Pro/T8140 and M4/T8132 onwards) the
- * NVMMU has its own register window, the I/O queue addresses are also
- * programmed through dedicated registers, and the ANS coprocessor cannot
- * be reset or restarted once running: clearing CPU_CTRL.RUN is one-way
- * and asserting its PMGR reset raises an SError.  The boot loader that
- * started the firmware (m1n1) hands it over with its RTKit session live,
- * and every later stage adopts that session instead of booting it.
+ * Newer ANS generations use explicit I/O queue registers. A18-class
+ * controllers retain a live RTKit session across boot stages; T8132 uses
+ * GravityLinux's cold shutdown/reset handoff and shared NVMe aperture.
  */
 struct apple_nvme_hw {
 	bool post_m4;
+	bool cold_reset;
 };
 
 static const struct apple_nvme_hw apple_nvme_t8103_hw = {
@@ -89,6 +88,11 @@ static const struct apple_nvme_hw apple_nvme_t8103_hw = {
  */
 static const struct apple_nvme_hw apple_nvme_t8132_hw = {
 	.post_m4 = true,
+	/*
+	 * Live OS handoff: restarting ANS in Linux times out the NAND link
+	 * (apcie0 L1_IDLE assert), so leave it running for nvme-apple to adopt.
+	 */
+	.cold_reset = false,
 };
 
 struct apple_nvme_priv {
@@ -193,6 +197,32 @@ static void apple_nvme_complete_cmd(struct nvme_queue *nvmeq,
 	nvmeq->sq_tail = tail;
 }
 
+/*
+ * Post-M4 ANS is handed to Linux running (spec 08 §8.6): its firmware keeps
+ * writing to the buffers U-Boot gave it, so remember them and describe them
+ * as reserved memory in the OS device tree.  Not no-map: Linux's nvme-apple
+ * reuses an inherited buffer only if its pages are reserved but still in the
+ * linear map.
+ */
+#define APPLE_NVME_MAX_HANDOFF_BUFS	8
+static struct fdt_memory apple_nvme_handoff_bufs[APPLE_NVME_MAX_HANDOFF_BUFS];
+static unsigned int apple_nvme_nhandoff_bufs;
+
+int apple_nvme_fdt_fixup(void *blob)
+{
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < apple_nvme_nhandoff_bufs; i++) {
+		ret = fdtdec_add_reserved_memory(blob, "apple-ans",
+						 &apple_nvme_handoff_bufs[i],
+						 NULL, 0, NULL, 0);
+		if (ret < 0)
+			return ret;
+	}
+	return 0;
+}
+
 static int nvme_shmem_setup(void *cookie, struct apple_rtkit_buffer *buf)
 {
 	struct apple_nvme_priv *priv = (struct apple_nvme_priv *)cookie;
@@ -212,6 +242,16 @@ static int nvme_shmem_setup(void *cookie, struct apple_rtkit_buffer *buf)
 	}
 
 	buf->dva = (u64)buf->buffer;
+
+	if (priv->hw->post_m4 && !priv->hw->cold_reset) {
+		struct fdt_memory *m;
+
+		if (apple_nvme_nhandoff_bufs == APPLE_NVME_MAX_HANDOFF_BUFS)
+			return -ENOSPC;
+		m = &apple_nvme_handoff_bufs[apple_nvme_nhandoff_bufs++];
+		m->start = (ulong)buf->buffer;
+		m->end = m->start + ALIGN(buf->size, SZ_16K) - 1;
+	}
 
 	return 0;
 }
@@ -247,6 +287,9 @@ static int apple_nvme_queue_created(struct nvme_queue *nvmeq)
 	 */
 	nvme_writeq((ulong)nvmeq->cqes, priv->base + ANS_IOCQ_BASE);
 	nvme_writeq((ulong)nvmeq->sq_cmds, priv->base + ANS_IOSQ_BASE);
+	/* GravityLinux/u-boot 49840d5797: T8132 ignores the qsize in Create CQ/SQ. */
+	writel((nvmeq->q_depth - 1) | ((nvmeq->q_depth - 1) << 16),
+	       priv->base + ANS_MAX_PEND_CMDS_CTRL);
 
 	return 0;
 }
@@ -381,11 +424,16 @@ static int apple_nvme_boot(struct udevice *dev)
 	}
 
 	writel(ANS_LINEAR_SQ_CTRL_EN, priv->base + ANS_LINEAR_SQ_CTRL);
-	writel(((ANS_MAX_QUEUE_DEPTH << 16) | ANS_MAX_QUEUE_DEPTH),
-	       priv->base + ANS_MAX_PEND_CMDS_CTRL);
-
-	writel(readl(priv->base + ANS_UNKNOWN_CTRL) & ~ANS_PRP_NULL_CHECK,
-	       priv->base + ANS_UNKNOWN_CTRL);
+	/*
+	 * GravityLinux/u-boot a2f6913694ff: IOQ_SIZE is published only after
+	 * Create CQ/SQ, together with their addresses in queue_created().
+	 */
+	if (!priv->hw->post_m4) {
+		writel(((ANS_MAX_QUEUE_DEPTH << 16) | ANS_MAX_QUEUE_DEPTH),
+		       priv->base + ANS_MAX_PEND_CMDS_CTRL);
+		writel(readl(priv->base + ANS_UNKNOWN_CTRL) & ~ANS_PRP_NULL_CHECK,
+		       priv->base + ANS_UNKNOWN_CTRL);
+	}
 
 	writel((ANS_NVMMU_TCB_SIZE / ANS_NVMMU_TCB_PITCH) - 1,
 	       priv->nvmmu + ANS_NVMMU_NUM);
@@ -416,6 +464,9 @@ static int apple_nvme_probe(struct udevice *dev)
 		priv->base = dev_read_addr_name_ptr(dev, "nvme");
 		priv->asc = dev_read_addr_name_ptr(dev, "ans");
 		priv->nvmmu = dev_read_addr_name_ptr(dev, "nvmmu");
+		/* Gravity's T8132 driver accesses NVMMU through the NVMe aperture. */
+		if (priv->hw->cold_reset || !priv->nvmmu)
+			priv->nvmmu = priv->base;
 		if (!priv->base || !priv->asc || !priv->nvmmu)
 			return -EINVAL;
 	} else {
@@ -431,7 +482,13 @@ static int apple_nvme_probe(struct udevice *dev)
 	}
 	priv->ndev.bar = priv->base;
 
-	if (priv->hw->post_m4)
+	/*
+	 * Adopt a live post-M4 session if the boot loader left one; otherwise
+	 * (Aura on T8132 sleeps and resets ANS at handoff) cold-boot it, as
+	 * GravityLinux/u-boot does on T8132.
+	 */
+	if (priv->hw->post_m4 && !priv->hw->cold_reset &&
+	    apple_nvme_ans_running(priv))
 		ret = apple_nvme_adopt(dev);
 	else
 		ret = apple_nvme_boot(dev);
@@ -455,7 +512,7 @@ static int apple_nvme_remove(struct udevice *dev)
 	struct apple_nvme_priv *priv = dev_get_priv(dev);
 	u32 ctrl;
 
-	if (priv->hw->post_m4) {
+	if (priv->hw->post_m4 && !priv->hw->cold_reset) {
 		/*
 		 * Hand the session over with RTKit live and the controller
 		 * enabled and ready, which is what Linux's nvme-apple adopts:
@@ -481,6 +538,7 @@ static int apple_nvme_remove(struct udevice *dev)
 		return 0;
 	}
 
+	/* GravityLinux/u-boot a2f6913694ff: sleep, stop and reset T8132 ANS. */
 	nvme_shutdown(dev);
 
 	apple_rtkit_shutdown(priv->rtk, APPLE_RTKIT_PWR_STATE_SLEEP);
@@ -495,9 +553,24 @@ static int apple_nvme_remove(struct udevice *dev)
 	priv->sart = NULL;
 
 	reset_assert_bulk(&priv->resets);
+	/* GravityLinux/u-boot 4b738f4f51: let the ANS reset reach the device. */
+	udelay(10);
 	reset_deassert_bulk(&priv->resets);
 
 	return 0;
+}
+
+/* GravityLinux/u-boot 61d4b40d3f: keep RTKit serviced during long waits. */
+static int apple_nvme_poll(struct nvme_dev *dev)
+{
+	struct apple_nvme_priv *priv =
+		container_of(dev, struct apple_nvme_priv, ndev);
+	int ret;
+
+	if (!priv->rtk)
+		return 0;
+	ret = apple_rtkit_poll(priv->rtk, 0);
+	return ret == -ETIMEDOUT ? 0 : ret;
 }
 
 static const struct nvme_ops apple_nvme_ops = {
@@ -505,6 +578,7 @@ static const struct nvme_ops apple_nvme_ops = {
 	.submit_cmd = apple_nvme_submit_cmd,
 	.complete_cmd = apple_nvme_complete_cmd,
 	.queue_created = apple_nvme_queue_created,
+	.poll = apple_nvme_poll,
 };
 
 static const struct udevice_id apple_nvme_ids[] = {
@@ -525,5 +599,9 @@ U_BOOT_DRIVER(apple_nvme) = {
 	.probe = apple_nvme_probe,
 	.remove = apple_nvme_remove,
 	.ops = &apple_nvme_ops,
-	.flags = DM_FLAG_OS_PREPARE,
+	/*
+	 * A live post-M4 handoff needs ANS and its apcie0 domain powered:
+	 * switching them off at removal drops the NAND link under the firmware.
+	 */
+	.flags = DM_FLAG_OS_PREPARE | DM_FLAG_LEAVE_PD_ON,
 };

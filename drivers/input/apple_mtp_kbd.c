@@ -451,7 +451,14 @@ static int apple_mtp_kbd_probe(struct udevice *dev)
 		return -ENOMEM;
 
 	priv->kbd_iface = -1;
-	priv->announce = dev_read_bool(dev, "apple,no-stm");
+	/*
+	 * Firmware that announces its interfaces (INIT) needs the keyboard
+	 * interface enabled before it sends reports.  J604 / T8132 MTP does
+	 * this too, and Linux expects the READY event to have been seen
+	 * (spec 03 §5), so use the same path there.
+	 */
+	priv->announce = dev_read_bool(dev, "apple,no-stm") ||
+			 of_machine_is_compatible("apple,t8132");
 	if (priv->announce) {
 		priv->pkt = malloc(DCHID_MAX_PKT);
 		if (!priv->pkt) {

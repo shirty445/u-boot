@@ -708,6 +708,16 @@ struct nvme_ops {
 	 * Return: 0 if OK, -ve on error
 	 */
 	int (*queue_created)(struct nvme_queue *nvmeq);
+	/**
+	 * poll - Service controller firmware while waiting for hardware
+	 *
+	 * From GravityLinux/u-boot commit 61d4b40d3f ("nvme: apple: Service
+	 * RTKit messages while waiting for the controller").
+	 *
+	 * @dev: NVM Express controller
+	 * Return: 0 if OK, -ve on error
+	 */
+	int (*poll)(struct nvme_dev *dev);
 };
 
 /**

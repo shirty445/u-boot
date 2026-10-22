@@ -40,3 +40,4 @@ int apple_rtkit_helper_poll(struct udevice *dev, ulong timeout);
 bool apple_rtkit_helper_allowed(ofnode node);
 /* Describe a helper the OS must adopt while it runs (OS device tree fixup). */
 int apple_rtkit_helper_fdt_fixup(void *blob);
+int apple_nvme_fdt_fixup(void *blob);

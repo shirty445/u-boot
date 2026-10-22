@@ -30,6 +30,7 @@
  */
 #define RTKIT_HELPER_HANDOFF	"mtp-live-v1"
 #define RTKIT_HELPER_MAX_BUFS	8
+#define RTKIT_HELPER_SYSTEM_BUFS	4
 
 struct rtkit_helper_buf {
 	u64 dva;
@@ -55,34 +56,50 @@ struct rtkit_helper_priv {
 	int nbufs;
 	/* The OS device tree describes the running session; see remove(). */
 	bool handoff_published;
+	/* The OS must know each endpoint's exact negotiated buffer geometry. */
+	struct {
+		u64 dva;
+		size_t size;
+		u8 endpoint;
+		bool mapped;
+	} system_bufs[RTKIT_HELPER_SYSTEM_BUFS];
+	unsigned int nsystem_bufs;
+	bool system_bufs_incomplete;
 };
 
 static bool rtkit_helper_uses_dram(struct udevice *dev)
 {
 	return IS_ENABLED(CONFIG_APPLE_MTP_KEYB) &&
-	       device_is_compatible(dev, "apple,t8140-rtk-helper-asc4");
+	       (device_is_compatible(dev, "apple,t8140-rtk-helper-asc4") ||
+		device_is_compatible(dev, "apple,t8132-rtk-helper-asc4"));
 }
 
-static void rtkit_helper_read_dma_window(struct udevice *dev)
+static int rtkit_helper_read_dma_window(struct udevice *dev)
 {
 	struct rtkit_helper_priv *priv = dev_get_priv(dev);
 	struct ofnode_phandle_args args;
 	u64 range[2];
+	int ret;
 
-	if (dev_read_phandle_with_args(dev, "iommus", "#iommu-cells", 0, 0,
-				       &args))
-		return;
-	if (ofnode_read_u64_array(args.node, "apple,dma-range", range, 2) ||
-	    !range[1])
-		return;
-
-	priv->dma_start = range[0];
-	priv->dma_end = range[0] + range[1];
+	ret = dev_read_phandle_with_args(dev, "iommus", "#iommu-cells", 0, 0, &args);
+	if (ret)
+		return ret;
+	if (ofnode_read_bool(args.node, "apple,dma-range")) {
+		ret = ofnode_read_u64_array(args.node, "apple,dma-range", range, 2);
+		if (ret || !range[1] || range[0] > (u64)-1 - range[1])
+			return -EINVAL;
+		priv->dma_start = range[0];
+		priv->dma_end = range[0] + range[1];
+	}
 
 	/* A live handoff additionally needs the DART left in bypass. */
-	if (args.args_count == 1 &&
-	    !uclass_get_device_by_ofnode(UCLASS_IOMMU, args.node, &priv->dart))
-		priv->dart_sid = args.args[0];
+	if (args.args_count != 1)
+		return -EINVAL;
+	ret = uclass_get_device_by_ofnode(UCLASS_IOMMU, args.node, &priv->dart);
+	if (ret)
+		return ret;
+	priv->dart_sid = args.args[0];
+	return 0;
 }
 
 static void *rtkit_helper_alloc(struct rtkit_helper_priv *priv, size_t size)
@@ -103,6 +120,24 @@ static void *rtkit_helper_alloc(struct rtkit_helper_priv *priv, size_t size)
 	}
 
 	return map_sysmem(addr, size);
+}
+
+static void rtkit_helper_record_buffer(struct rtkit_helper_priv *priv,
+				       const struct apple_rtkit_buffer *buf)
+{
+	unsigned int i = priv->nsystem_bufs;
+
+	if ((buf->endpoint != 1 && buf->endpoint != 2 &&
+	     buf->endpoint != 4 && buf->endpoint != 8) ||
+	    !buf->size || buf->size > U32_MAX || i >= RTKIT_HELPER_SYSTEM_BUFS) {
+		priv->system_bufs_incomplete = true;
+		return;
+	}
+	priv->system_bufs[i].dva = buf->dva;
+	priv->system_bufs[i].size = buf->size;
+	priv->system_bufs[i].endpoint = buf->endpoint;
+	priv->system_bufs[i].mapped = buf->is_mapped;
+	priv->nsystem_bufs++;
 }
 
 static int shmem_setup(void *cookie, struct apple_rtkit_buffer *buf) {
@@ -128,6 +163,7 @@ static int shmem_setup(void *cookie, struct apple_rtkit_buffer *buf) {
 				return -EFAULT;
 
 			priv->sram_stolen = true;
+			rtkit_helper_record_buffer(priv, buf);
 			return 0;
 		}
 
@@ -147,6 +183,7 @@ static int shmem_setup(void *cookie, struct apple_rtkit_buffer *buf) {
 			priv->bufs[priv->nbufs].size = ALIGN(buf->size, SZ_16K);
 		}
 		priv->nbufs++;
+		rtkit_helper_record_buffer(priv, buf);
 		return 0;
 	}
 
@@ -158,6 +195,7 @@ static int shmem_setup(void *cookie, struct apple_rtkit_buffer *buf) {
 			buf->dva, buf->size);
 		return -EFAULT;
 	}
+	rtkit_helper_record_buffer(priv, buf);
 	return 0;
 }
 
@@ -206,8 +244,11 @@ static int rtkit_helper_probe(struct udevice *dev)
 	if (ret < 0)
 		return ret;
 
-	if (rtkit_helper_uses_dram(dev))
-		rtkit_helper_read_dma_window(dev);
+	if (rtkit_helper_uses_dram(dev)) {
+		ret = rtkit_helper_read_dma_window(dev);
+		if (ret)
+			return ret;
+	}
 
 	ctrl = readl(priv->asc + REG_CPU_CTRL);
 	writel(ctrl | REG_CPU_CTRL_RUN, priv->asc + REG_CPU_CTRL);
@@ -299,9 +340,11 @@ static int rtkit_helper_fdt_publish(struct udevice *dev, void *blob)
 	char name[48];
 	u32 phandle, rphandle;
 	fdt64_t reg[2];
+	fdt32_t inventory[RTKIT_HELPER_SYSTEM_BUFS * 5];
 
 	if (!priv->rtk || !priv->dart || !priv->nbufs ||
-	    priv->nbufs > RTKIT_HELPER_MAX_BUFS)
+	    priv->nbufs > RTKIT_HELPER_MAX_BUFS ||
+	    priv->system_bufs_incomplete || !priv->nsystem_bufs)
 		return -ENODEV;
 	if (!(readl(priv->asc + REG_CPU_CTRL) & REG_CPU_CTRL_RUN))
 		return -ENODEV;
@@ -362,6 +405,20 @@ static int rtkit_helper_fdt_publish(struct udevice *dev, void *blob)
 		return -ENOSPC;
 
 	node = rtkit_helper_fdt_node(blob, dev);
+	if (node < 0)
+		return -ENOENT;
+	for (i = 0; i < priv->nsystem_bufs; i++) {
+		inventory[5 * i] = cpu_to_fdt32(priv->system_bufs[i].endpoint);
+		inventory[5 * i + 1] = cpu_to_fdt32(priv->system_bufs[i].dva >> 32);
+		inventory[5 * i + 2] = cpu_to_fdt32(priv->system_bufs[i].dva);
+		inventory[5 * i + 3] = cpu_to_fdt32(priv->system_bufs[i].size);
+		inventory[5 * i + 4] = cpu_to_fdt32(priv->system_bufs[i].mapped);
+	}
+	ret = fdt_setprop(blob, node, "apple,rtkit-buffers", inventory,
+			  priv->nsystem_bufs * 5 * sizeof(*inventory));
+	if (ret)
+		return ret;
+	node = rtkit_helper_fdt_node(blob, dev);
 	if (node < 0 ||
 	    fdt_setprop_string(blob, node, "apple,rtkit-handoff",
 			       RTKIT_HELPER_HANDOFF))
@@ -395,6 +452,8 @@ int apple_rtkit_helper_fdt_fixup(void *blob)
 			apple_dart_release_bypass(priv->dart);
 			dev_warn(dev, "no live OS handoff (%d); stopping RTKit at boot\n",
 				 ret);
+			if (of_machine_is_compatible("apple,j604"))
+				return ret;
 		}
 	}
 
